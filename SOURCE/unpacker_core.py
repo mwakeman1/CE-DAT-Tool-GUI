@@ -1,6 +1,6 @@
 # Combined DAT Unpacker Core Logic and GUI with File Type Detection
 # Based on original C# snippets, QuickBMS script, and troubleshooting.
-# Version 1.6: Corrected Helpers.copy_to SyntaxError.
+# Version 1.7: Modified file type detection to EXACTLY match QuickBMS script logic.
 
 import os
 import struct
@@ -136,21 +136,19 @@ class Helpers:
              except EOFError: break
         return result
 
-    # ** Corrected copy_to method **
+    # Corrected copy_to method
     @staticmethod
     def copy_to(source: io.BufferedIOBase, target: io.BufferedIOBase):
         buffer_size = 32768
         while True: # Start of loop
             buffer = source.read(buffer_size)
-            # Check if the buffer is empty AFTER reading
-            if not buffer:
-                break # Exit the loop if EOF is reached
-            # If the buffer is NOT empty, write it
-            target.write(buffer)
+            if not buffer: break # Exit the loop if EOF is reached
+            target.write(buffer) # If the buffer is NOT empty, write it
         # Loop finishes when break is hit
 
 # --- ByteArrayExtensions.cs ---
 class ByteArrayExtensions:
+    # Note: is_text is no longer used by detect_file_type_and_name but kept for potential future use
     @staticmethod
     def read_bytes(data: bytes, count: int, start_index: int = 0) -> bytes:
         if start_index + count > len(data): raise IndexError("Read beyond bounds"); return data[start_index : start_index + count]
@@ -183,19 +181,17 @@ class ByteArrayExtensions:
             s, next_index = ByteArrayExtensions._read_string_internal(data, current_index, encoding, trim); result.append(s); current_index = next_index
         return result
 
-    # Corrected is_text method
     @staticmethod
     def is_text(data: bytes) -> bool:
-        limit = min(len(data), 100) # Check first 100 bytes
-        if limit == 0:
-             return True # Empty file is arguably 'text' or at least not binary
+        limit = min(len(data), 100);
+        if limit == 0: return True
         has_binary = any(not (b == 0 or b == 9 or b == 10 or b == 13 or 32 <= b <= 126) for b in data[:limit])
         if has_binary: return False
         try:
             sample_text = data[:limit].decode('ascii', errors='replace').strip()
             if sample_text.startswith('#') or any(kw in sample_text for kw in ['v ', 'vt ', 'vn ', 'f ', 'mtllib', 'usemtl']): return True
-            return True # Assume text if no obvious binary chars found
-        except Exception: return False # Treat as binary if processing fails
+            return True
+        except Exception: return False
 
 # --- DatHash.cs ---
 class DatHash:
@@ -218,14 +214,12 @@ class DatHash:
 
 # --- DatHashList.cs ---
 class DatHashList:
-    # ** Corrected Path Logic: Assumes FileNames.list is in SAME directory as script **
     m_ScriptPath = Utils.iGetApplicationPath()
     m_ProjectFile = "FileNames.list"
-    m_ProjectFilePath = os.path.join(m_ScriptPath, m_ProjectFile) # Look only next to script
-    _project_file_found = os.path.exists(m_ProjectFilePath) # Check existence once
+    m_ProjectFilePath = os.path.join(m_ScriptPath, m_ProjectFile)
+    _project_file_found = os.path.exists(m_ProjectFilePath)
     m_HashList: Dict[int, str] = {}
 
-    # ** Corrected iLoadProject method structure **
     @staticmethod
     def iLoadProject():
         if not DatHashList._project_file_found:
@@ -278,46 +272,56 @@ class DatHelpers:
                     read_size = min(dwBytesLeft, MAX_BUFFER); lpBuffer = Helpers.read_bytes(TArchiveStream, read_size); TDstStream.write(lpBuffer); dwBytesLeft -= read_size
         except Exception as e: Utils.iSetError(f"Error writing {m_FullPath}: {e}")
 
-# --- DatUnpack.cs (Modified for File Type Detection & OBJ Heuristic) ---
+# --- DatUnpack.cs (MODIFIED to match QuickBMS extension logic) ---
 class DatUnpack:
     m_EntryTable: List[DatEntry] = []
 
     @staticmethod
     def detect_file_type_and_name(archive_path: str, entry: DatEntry) -> Tuple[str, str]:
-        """Detects file type, returns (relative_path_with_extension, detected_extension)"""
+        """
+        Detects file type based *only* on magic number, matching QuickBMS.
+        Returns tuple: (relative_path_with_extension, detected_extension)
+        """
         base_name_known = DatHashList.iGetNameFromHashList(entry.dwHash)
-        detected_ext = ".bin"; magic_int = None
-        try:
-            if entry.dwSize >= 4:
+        # ** FIX: Default extension changed to .txt **
+        detected_ext = ".txt"
+        magic_int = None
+
+        # Try reading magic number (first 4 bytes)
+        if entry.dwSize >= 4:
+            try:
                 with open(archive_path, 'rb') as f: f.seek(entry.dwOffset); header_bytes = Helpers.read_bytes(f, 4)
                 magic_int = struct.unpack('<I', header_bytes)[0]
-        except Exception: pass
+            except Exception: pass # Ignore errors reading magic number
+
+        # Check known magic numbers from QuickBMS script
         if magic_int is not None:
-            if magic_int == 1196314761: detected_ext = ".png"
-            elif magic_int == 542327876: detected_ext = ".dds"
-            elif magic_int == 1245859653: detected_ext = ".bin_obj_4A4F4205"
-            elif magic_int == 2: detected_ext = ".fmt_02"
-        if detected_ext == ".bin" or detected_ext == ".bin_obj_4A4F4205":
-             if entry.dwSize > 10:
-                 try:
-                     read_limit = min(entry.dwSize, 100)
-                     with open(archive_path, 'rb') as f: f.seek(entry.dwOffset); sample_bytes = Helpers.read_bytes(f, read_limit)
-                     if ByteArrayExtensions.is_text(sample_bytes):
-                          try:
-                               sample_text = sample_bytes.decode('ascii').strip()
-                               if sample_text.startswith('#') or any(kw in sample_text for kw in ['v ', 'vt ', 'vn ', 'f ', 'mtllib', 'usemtl']): detected_ext = ".obj"
-                          except UnicodeDecodeError: pass
-                 except Exception: pass
-        if base_name_known: name_part = os.path.splitext(base_name_known)[0]; relative_path = name_part + detected_ext
-        else: relative_path = os.path.join("__Unknown", f"{entry.dwHash:08X}{detected_ext}")
+            if magic_int == 1196314761: detected_ext = ".png"    # 0x474E5089 PNG
+            elif magic_int == 542327876: detected_ext = ".dds"    # 0x20534444 DDS
+            elif magic_int == 1245859653: detected_ext = ".obj"    # 0x4A4F4205 QuickBMS calls this obj
+            elif magic_int == 2: detected_ext = ".fmt_02" # 0x00000002 Use slightly more descriptive name
+
+        # ** FIX: Removed the text heuristic check to match QuickBMS **
+        # (No check for text obj if magic number doesn't match)
+
+        # Construct final relative path
+        if base_name_known:
+            # Use known name, remove any existing extension, add detected one
+            name_part = os.path.splitext(base_name_known)[0]
+            relative_path = name_part + detected_ext
+        else:
+            # Unknown hash, use __Unknown\HASHVALUE.ext format
+            relative_path = os.path.join("__Unknown", f"{entry.dwHash:08X}{detected_ext}")
+
         return relative_path, detected_ext
+
 
     @staticmethod
     def iDoIt(m_Archive: str, m_DstFolder: str):
         try:
             m_DstFolder = Utils.iCheckArgumentsPath(m_DstFolder); DatHashList.iLoadProject()
             DatUnpack.m_EntryTable.clear()
-            try:
+            try: # Read index
                 with open(m_Archive, 'rb') as TDatStream:
                     while True:
                         entry_data = TDatStream.read(12);
@@ -327,13 +331,17 @@ class DatUnpack:
                         if dwSize < 0: Utils.iSetWarning(f"Skipping entry hash {dwHash:08X}, negative size ({dwSize})"); continue
                         DatUnpack.m_EntryTable.append(DatEntry(dwHash, dwOffset, dwSize))
             except Exception as read_err: Utils.iSetError(f"Failed reading index: {read_err}"); return
+
             total_entries = len(DatUnpack.m_EntryTable); Utils.iSetInfo(f"Read {total_entries} entries.")
             if total_entries == 0: Utils.iSetWarning("No file entries found."); return
+
+            # Process entries
             processed_count = 0
             for index, m_Entry in enumerate(DatUnpack.m_EntryTable):
+                # ** Use the modified detection logic **
                 relative_path, _ = DatUnpack.detect_file_type_and_name(m_Archive, m_Entry)
                 m_FullPath = os.path.join(m_DstFolder, relative_path); m_FullPath = os.path.normpath(m_FullPath)
-                Utils.iSetInfo(f"[UNPACKING {index + 1}/{total_entries}]: {relative_path}")
+                Utils.iSetInfo(f"[UNPACKING {index + 1}/{total_entries}]: {relative_path}") # Log name with new extension
                 DatHelpers.ReadWriteFile(m_Archive, m_FullPath, m_Entry.dwOffset, m_Entry.dwSize)
                 processed_count += 1
             Utils.iSetInfo(f"[INFO]: Unpacking completed. Processed {processed_count} files.")
@@ -356,7 +364,7 @@ def run_unpacking_thread(archive_path: str, output_path: str):
     try:
         g_status_message = "Processing... (See console for details)"
         Utils.iSetInfo(f"Starting unpack: {archive_path} -> {output_path}")
-        DatUnpack.iDoIt(archive_path, output_path)
+        DatUnpack.iDoIt(archive_path, output_path) # Calls the modified version
         g_status_message = "Unpacking completed! Check output folder and console log."
         Utils.iSetInfo(g_status_message)
     except Exception as e:
@@ -421,7 +429,7 @@ def gui_loop():
 # --- Application Entry Point ---
 def main():
     """Sets up and runs the ImGui application"""
-    try: immapp.run(gui_function=gui_loop, window_title="DAT Unpacker (v1.5 - Final Fixes)", window_size=[700, 300]) # Updated title
+    try: immapp.run(gui_function=gui_loop, window_title="DAT Unpacker (v1.7 - BMS Logic)", window_size=[700, 300]) # Updated title
     except Exception as e:
         print(f"\n--- GUI CRASH ---", file=sys.stderr); print(f"Error: {e}", file=sys.stderr); traceback.print_exc(); print(f"--- END GUI CRASH ---", file=sys.stderr)
         try: root = tk.Tk(); root.withdraw(); from tkinter import messagebox; messagebox.showerror("GUI Error", f"Critical error:\n{e}\n\nSee console output."); root.destroy()
